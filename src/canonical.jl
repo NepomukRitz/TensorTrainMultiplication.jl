@@ -21,26 +21,30 @@ function left_canonical!(cores::Vector{Array{T,3}}) where {T}
 end
 
 """
-    sweep_truncate!(cores, cutoff, maxbonddim) -> (discarded, capped)
+    sweep_truncate!(cores, cutoff, maxbonddim) -> (discarded, capped, sqrtsum)
 
 One SVD sweep from the first core to the last for a train whose orthogonality centre is on
 the first core and whose other cores are right-orthogonal. Every bond is truncated with
 [`truncated_rank`](@ref); the train ends left-canonical with the norm on the last core.
-Returns the summed relative discarded weight and whether `maxbonddim` removed anything.
+Returns the summed relative discarded weight, whether `maxbonddim` removed anything, and
+the sum of the square roots of the discarded weights (this sweep's contribution to the
+rigorous error bound).
 """
 function sweep_truncate!(cores::Vector{Array{T,3}}, cutoff::Real, maxbonddim::Integer) where {T}
     discarded = 0.0
+    sqrtsum = 0.0
     capped = false
     for p in 1:(length(cores) - 1)
         l, d, r = size(cores[p])
         F = svd!(reshape(cores[p], l * d, r))
         k, w, c = truncated_rank(F.S, cutoff, maxbonddim)
         discarded += w
+        sqrtsum += sqrt(w)
         capped |= c
         cores[p] = reshape(F.U[:, 1:k], l, d, k)
         carry = Diagonal(F.S[1:k]) * F.Vt[1:k, :]
         l2, d2, r2 = size(cores[p + 1])
         cores[p + 1] = reshape(carry * reshape(cores[p + 1], l2, d2 * r2), k, d2, r2)
     end
-    return discarded, capped
+    return discarded, capped, sqrtsum
 end

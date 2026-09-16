@@ -11,6 +11,7 @@ include("helpers.jl")
 @testset "TensorTrainMultiplication" begin
     include("test_truncation.jl")
     include("test_canonical.jl")
+    include("test_sampling.jl")
     include("test_multiply.jl")
     include("test_aqua.jl")
 end

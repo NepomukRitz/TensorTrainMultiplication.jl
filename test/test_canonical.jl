@@ -20,7 +20,8 @@
         # reversing a left-canonical train produces exactly that.
         rev = [permutedims(c, (3, 2, 1)) for c in reverse(LC([copy(a) for a in A]))]
         vrev = dense_vector(rev)
-        w, capped = ST(rev, 0.0, typemax(Int))
+        w, capped, sqrtsum = ST(rev, 0.0, typemax(Int))
+        @test sqrtsum == 0.0
         @test dense_vector(rev) ≈ vrev
         @test w == 0.0 && !capped
         bonds = [size(c, 3) for c in rev[1:(end - 1)]]
@@ -32,7 +33,8 @@
             @test Q' * Q ≈ I(r) atol = 1e-12
         end
 
-        w, capped = ST(rev, 0.0, 2)
+        w, capped, sqrtsum = ST(rev, 0.0, 2)
+        @test sqrtsum >= sqrt(w)
         @test capped && all(size(c, 3) <= 2 for c in rev[1:(end - 1)])
         @test w > 0
     end
