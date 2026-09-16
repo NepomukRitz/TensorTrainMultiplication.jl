@@ -17,7 +17,9 @@ Accuracy, three fields that mean different things:
   `nsamples` uniform random multi-indices against the exact `A(x) B(x)`; consistent, no
   reference computation. `NaN` when `nsamples == 0`.
 - `verified`: a `tolerance` was requested, `error_estimate + 2 error_stderr <= tolerance`,
-  and the sample was informative (see `min_ess`). `false` in `cutoff` mode.
+  and the sample saw the residual (see `min_ess`). `false` in `cutoff` mode. It says that the
+  *sampled* residual is below the tolerance at this sample size, not that the true error is;
+  a residual living on a vanishing fraction of the grid can pass it.
 - `error_bound`: the rigorous bound `sum_i sqrt(w_i)` over every truncation (each happens in
   mixed-canonical gauge, so its error is exactly `sqrt(w_i)` times the current norm, and the
   triangle inequality sums them). Always valid, and pessimistic by a factor that grows with
@@ -27,12 +29,16 @@ Accuracy, three fields that mean different things:
 `attempts` counts the passes run and `cutoffs` lists their cutoffs, the last being the
 returned product's.
 
-Three fields say whether the sample could see the error at all:
+Three fields describe the sample itself, all `NaN` when nothing was sampled:
 
-- `ess_num` and `ess_den`: the effective sample size of the residual and of the product
-  sample (see [`effective_sample_size`](@ref)). `NaN` when nothing was sampled.
-- `min_ess`: the effective sample size `verified` demands of both, unless `error_bound`
-  already meets the tolerance on its own.
+- `ess_num`: the effective sample size of the residual (see [`effective_sample_size`](@ref)) --
+  how much of the sample carried the error. This is the one `verified` gates on.
+- `ess_den`: the same for the product's own magnitude. Reported, not gated on: a sharply
+  peaked product is heavy-tailed here by construction, and a small `ess_den` inflates the
+  uncertainty of the estimate by about `1 / sqrt(ess_den)` in relative terms rather than
+  invalidating it.
+- `min_ess`: the `ess_num` that `verified` demands, unless `error_bound` already meets the
+  tolerance on its own.
 """
 struct MultiplyInfo
     peak_bonddim::Int
@@ -208,11 +214,12 @@ neither can be helped by a smaller cutoff. The result carries `info.error_estima
 `info.error_stderr` and `info.verified`; an unverified product (a bond cap, or the attempt
 limit) is returned, not thrown, and the caller decides.
 
-Verification also needs the sample to carry the error: the effective sample size of both the
-residual and the product must reach `min_ess`, unless `info.error_bound` meets the tolerance
-on its own and no sampling is needed. A uniform sample cannot certify a product whose residual
-lives on a vanishing fraction of the grid, so such a product comes back `verified = false`
-rather than falsely certified.
+Verification also needs the sample to have carried the error: `info.ess_num` must reach
+`min_ess`, unless `info.error_bound` meets the tolerance on its own and no sampling is needed.
+That refuses a product whose residual the sample saw once or not at all. It is a floor, not a
+proof: a residual on a vanishing fraction of the grid sitting above a uniform roundoff floor
+keeps `ess_num` high and is certified, so `verified` means the sampled residual is below the
+tolerance at this sample size, not that the true error is.
 
 **`cutoff` mode**, for expert use: one pass at a fixed relative discarded squared weight per
 SVD (the paper's `epsilon`, ITensors' relative `cutoff`). What it does *not* promise: the
@@ -272,7 +279,7 @@ function multiply(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:
         est, se, en, ed = sampled_relative_error(A, B, cores, rng, ns)
         previous - est > se || break
     end
-    informative = (en >= min_ess && ed >= min_ess) || pass.error_bound <= tolerance
+    informative = en >= min_ess || pass.error_bound <= tolerance
     return cores, MultiplyInfo(pass.peak_bonddim, pass.peak_bonddim_per_step, pass.bonddims,
                                pass.n_swaps, pass.discarded_weight, pass.hit_maxbonddim,
                                pass.error_bound, est, se, est + 2se <= tolerance && informative,

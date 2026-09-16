@@ -227,7 +227,8 @@ end
     got = [TensorTrainMultiplication.evaluate_cores(C, i) for i in support]
     @test norm(got - exact) / norm(exact) > 0.1          # the product is far off
     @test info.error_estimate == 0 && info.error_stderr == 0
-    @test info.ess_num < 30 && info.ess_den < 30         # the sample carries no mass
+    @test info.ess_num == 0                              # the gated quantity: no residual seen
+    @test info.ess_den == 0                              # reported too: no product seen either
     @test info.error_bound > 1e-3                        # and the bound does not rescue it
     @test !info.verified
 end
@@ -238,7 +239,7 @@ end
     B = quantics_train(x -> 1 / (1 + x), R)
     C, info = multiply(A, B; tolerance = 1e-4, rng = MersenneTwister(13))
     @test info.verified
-    @test info.ess_num >= 30 && info.ess_den >= 30
+    @test info.ess_num >= 30          # `min_ess` gates on this one; `ess_den` is reported only
     @test info.min_ess == 30
 end
 
