@@ -50,6 +50,20 @@ end
     C0, i0 = multiply(A, B; cutoff = 0.0, final_truncation = false)
     @test dense_vector(C0) ≈ dense_vector(C1)
     @test all(i0.bonddims .>= i1.bonddims)
+    # The swaps leave bonds above the exact ranks of the product; only the final sweep brings
+    # them down. Without this, a `final_truncation` that is never read would pass the testset.
+    @test any(i0.bonddims .> i1.bonddims)
+end
+
+@testset "multiply leaves its inputs untouched" begin
+    rng = MersenneTwister(11)
+    A = random_train(rng, Float64, fill(2, 5), 3)
+    B = random_train(rng, Float64, fill(2, 5), 2)
+    A0 = deepcopy(A)
+    B0 = deepcopy(B)
+    multiply(A, B; cutoff = 1e-8)
+    @test A == A0
+    @test B == B0
 end
 
 @testset "truncation on smooth quantics functions" begin
