@@ -15,7 +15,7 @@ end
 """
     sampled_relative_error(A, B, C, rng, nsamples) -> (estimate, stderr)
 
-Unbiased sampled estimate of the relative L2 error `||C - A o B||_2 / ||A o B||_2` over the
+Sampled estimate of the relative L2 error `||C - A o B||_2 / ||A o B||_2` over the
 full index grid, from `nsamples` uniform random multi-indices, with its standard error by
 the delta method on the numerator. `A(x) B(x)` is exact for the trains as given, so the
 estimate needs no reference computation. Returns `(0.0, 0.0)` when both `C` and `A o B`

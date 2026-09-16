@@ -14,7 +14,7 @@ Accuracy, three fields that mean different things:
 
 - `error_estimate` and `error_stderr`: the sampled relative L2 error
   `||C - A o B||_2 / ||A o B||_2` of the returned product and its standard error, from
-  `nsamples` uniform random multi-indices against the exact `A(x) B(x)`; unbiased, no
+  `nsamples` uniform random multi-indices against the exact `A(x) B(x)`; consistent, no
   reference computation. `NaN` when `nsamples == 0`.
 - `verified`: a `tolerance` was requested and `error_estimate + 2 error_stderr <= tolerance`.
   `false` in `cutoff` mode.
