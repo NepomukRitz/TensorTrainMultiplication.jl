@@ -5,7 +5,8 @@ Michailidis, Fenton and Kiffner, *Tensor Train Multiplication*, arXiv:2410.19747
 
 ```julia
 using TensorTrainMultiplication
-C, info = multiply(A, B; cutoff = 1e-9)
+C, info = multiply(A, B; tolerance = 1e-6)    # the error is measured, not assumed
+info.verified, info.error_estimate, info.peak_bonddim
 ```
 
 `A` and `B` are `Vector{<:AbstractArray{T,3}}` cores laid out `(left, site, right)` with
@@ -28,27 +29,44 @@ added 9 GB (ReFrequenTT, `docs/notes/analyses/ttm_product_benchmark.md`).
 
 ## Accuracy semantics
 
-`cutoff` is the relative discarded squared weight per truncated SVD,
+Exactly one of `tolerance` and `cutoff` must be given; there is no default.
+
+**`tolerance`** is a relative L2 error of the whole product, `||C - A o B||_2 / ||A o B||_2`,
+and it is *measured*. The exact residual `C(x) - A(x) B(x)` is sampled at `nsamples` random
+multi-indices -- no reference product is ever formed, because `A(x) B(x)` is exact for the
+trains as given -- and the cutoff is tightened from a pilot pass until
+`error_estimate + 2 error_stderr <= tolerance`. The result carries `info.error_estimate`,
+`info.error_stderr` and `info.verified`; a product that a bond cap or the attempt limit left
+unverified is returned, not thrown, and the caller decides.
+
+**`cutoff`** is for expert use: the relative discarded squared weight per truncated SVD,
 
     sum_{dropped} s_i^2 / sum_all s_i^2 <= cutoff,
 
-which is `epsilon` of the paper's Eq. 10 and ITensors' relative `cutoff`. The paper finds a
-squared relative error of about `10 cutoff` for the whole product, i.e. a relative L2 error
-of about `sqrt(10 cutoff)`. The package tests assert that with a factor 3 of allowance on a
-smooth product and a factor 10 on a Lorentzian times a tanh step; products with sharp
-features sit nearer the upper end. `info.discarded_weight` is the sum of the relative
-discarded weights of every truncation; because every truncation is a global one (the
-swapped pair holds the orthogonality centre), the triangle inequality bounds the squared
-relative error by `n_swaps` times it. `maxbonddim` caps every bond the algorithm creates,
-intermediate ones included, inside the truncation; what it removes is reported in
-`info.discarded_weight` and `info.hit_maxbonddim`, never thrown. `final_truncation = true`
-(default) adds one truncating sweep and returns the result left-canonical.
+which is `epsilon` of the paper's Eq. 10 and ITensors' relative `cutoff`. It bounds *one*
+truncation. A train has many bonds and the errors add, so the total is a problem-dependent
+multiple of `sqrt(cutoff)` -- on sharp quantics products, about the number of bonds. Pass
+`nsamples > 0` to measure it.
+
+`info.error_bound` is the rigorous `sum_i sqrt(w_i)` over every truncation: each happens in
+mixed-canonical gauge, so its error is exactly `sqrt(w_i)` times the current norm and the
+triangle inequality sums them. It is always valid and pessimistic; a diagnostic, not the
+control. `info.discarded_weight` is the sum of the relative discarded weights themselves.
+`maxbonddim` caps every bond the algorithm creates, intermediate ones included, inside the
+truncation; what it removes is reported in `info.discarded_weight` and `info.hit_maxbonddim`,
+never thrown. `final_truncation = true` (default) adds one truncating sweep and returns the
+result left-canonical.
 
 ## API
 
-- `multiply(A, B; cutoff = 0.0, maxbonddim = typemax(Int), final_truncation = true) -> (C, info)`
+- `multiply(A, B; tolerance, maxbonddim = typemax(Int), final_truncation = true,
+  nsamples = 4000, rng = Random.default_rng(), pilot_cutoff = tolerance^2 / (N - 1)^2,
+  safety = 0.5, max_attempts = 3) -> (C, info)`
+- `multiply(A, B; cutoff, maxbonddim = typemax(Int), final_truncation = true,
+  nsamples = 0, rng = Random.default_rng()) -> (C, info)`
 - `MultiplyInfo`: `peak_bonddim`, `peak_bonddim_per_step`, `bonddims`, `n_swaps`,
-  `discarded_weight`, `hit_maxbonddim`.
+  `discarded_weight`, `hit_maxbonddim`, `error_bound`, `error_estimate`, `error_stderr`,
+  `verified`, `attempts`, `cutoffs`, `nsamples`.
 
 Threading is BLAS threading; the swap SVDs dominate and are LAPACK-bound.
 

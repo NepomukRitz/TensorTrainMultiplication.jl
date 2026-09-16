@@ -9,6 +9,23 @@ step `k` contracts carriage `N + 1 - k`; `bonddims` the bonds of the returned tr
 `n_swaps = N (N - 1) / 2`; `discarded_weight` the sum over every truncation of the relative
 discarded squared weight, noise-floor removals included; `hit_maxbonddim` whether
 `maxbonddim` removed anything.
+
+Accuracy, three fields that mean different things:
+
+- `error_estimate` and `error_stderr`: the sampled relative L2 error
+  `||C - A o B||_2 / ||A o B||_2` of the returned product and its standard error, from
+  `nsamples` uniform random multi-indices against the exact `A(x) B(x)`; unbiased, no
+  reference computation. `NaN` when `nsamples == 0`.
+- `verified`: a `tolerance` was requested and `error_estimate + 2 error_stderr <= tolerance`.
+  `false` in `cutoff` mode.
+- `error_bound`: the rigorous bound `sum_i sqrt(w_i)` over every truncation (each happens in
+  mixed-canonical gauge, so its error is exactly `sqrt(w_i)` times the current norm, and the
+  triangle inequality sums them). Always valid, and pessimistic by a factor that grows with
+  the number of truncating swaps: 2-16 on 12-site products, about 8 on a 28-site production
+  product. A diagnostic, not the control.
+
+`attempts` counts the passes run and `cutoffs` lists their cutoffs, the last being the
+returned product's.
 """
 struct MultiplyInfo
     peak_bonddim::Int
@@ -17,9 +34,16 @@ struct MultiplyInfo
     n_swaps::Int
     discarded_weight::Float64
     hit_maxbonddim::Bool
+    error_bound::Float64
+    error_estimate::Float64
+    error_stderr::Float64
+    verified::Bool
+    attempts::Int
+    cutoffs::Vector{Float64}
+    nsamples::Int
 end
 
-function _check_inputs(A, B, cutoff, maxbonddim)
+function _check_inputs(A, B)
     N = length(A)
     N == length(B) || throw(DimensionMismatch("A has $(N) cores, B has $(length(B))"))
     N >= 1 || throw(ArgumentError("multiply needs at least one core"))
@@ -37,46 +61,29 @@ function _check_inputs(A, B, cutoff, maxbonddim)
                 "$(name): bond between cores $(i) and $(i + 1) has dimensions $(size(X[i], 3)) and $(size(X[i + 1], 1))"))
         end
     end
-    cutoff >= 0 || throw(ArgumentError("cutoff must be non-negative, got $(cutoff)"))
-    maxbonddim >= 1 || throw(ArgumentError("maxbonddim must be at least 1, got $(maxbonddim)"))
     return N
 end
 
 """
-    multiply(A, B; cutoff = 0.0, maxbonddim = typemax(Int), final_truncation = true)
-        -> (C, info::MultiplyInfo)
+    _multiply_pass(A, B, cutoff, maxbonddim, final_truncation) -> (cores, pass)
 
-Elementwise product `C(x) = A(x) B(x)` of two tensor trains with the same site dimensions,
-by the swap network of arXiv:2410.19747, Fig. 1B.
-
-`A` and `B` are vectors of three-leg cores laid out `(left, site, right)` with dimension-one
-boundary bonds, or `TensorCrossInterpolation.TensorTrain{T,3}`; the result has the kind of
-the inputs and the promoted element type. Inputs are not modified.
-
-`cutoff` is the relative discarded squared weight allowed at every truncated SVD: the paper's
-`epsilon` (Eq. 10) and ITensors' relative `cutoff`, so a value tuned for one carries over
-to the other. The paper measures a squared relative error of about `10 cutoff`, i.e. a
-relative L2 error of about `sqrt(10 cutoff)`. `maxbonddim` caps every bond, including the
-intermediate ones, inside the SVD truncation, so it bounds cost and memory; what it removes is
-reported in `info.discarded_weight` and `info.hit_maxbonddim` rather than thrown. With
-`final_truncation = true` the result receives one more truncating sweep and is returned
-left-canonical with the norm on its last core.
-
-Cost `O(N^2 d^3 chi^3)`, memory `O(d^2 chi^2)`, with `chi` the largest intermediate bond
-dimension, `info.peak_bonddim`.
+One swap-network pass at a fixed `cutoff`, returning the product's cores and a NamedTuple whose
+fields are, in order, the first seven fields of [`MultiplyInfo`](@ref).
 """
-function multiply(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:AbstractArray{TB,3}};
-                  cutoff::Real = 0.0, maxbonddim::Integer = typemax(Int),
-                  final_truncation::Bool = true) where {TA<:Number,TB<:Number}
+function _multiply_pass(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:AbstractArray{TB,3}},
+                        cutoff::Real, maxbonddim::Integer,
+                        final_truncation::Bool) where {TA<:Number,TB<:Number}
     T = promote_type(TA, TB)
-    N = _check_inputs(A, B, cutoff, maxbonddim)
+    N = _check_inputs(A, B)
     if N == 1
         d = size(A[1], 2)
         C = Array{T,3}(undef, 1, d, 1)
         for s in 1:d
             C[1, s, 1] = A[1][1, s, 1] * B[1][1, s, 1]
         end
-        return [C], MultiplyInfo(1, [1], Int[], 0, 0.0, false)
+        return ([C], (peak_bonddim = 1, peak_bonddim_per_step = [1], bonddims = Int[],
+                      n_swaps = 0, discarded_weight = 0.0, hit_maxbonddim = false,
+                      error_bound = 0.0))
     end
 
     f = left_canonical!([Array{T,3}(a) for a in A])
@@ -94,6 +101,7 @@ function multiply(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:
 
     peak_per_step = zeros(Int, N)
     discarded = 0.0
+    bound = 0.0
     capped = false
     for i in N:-1:1
         # chain[1:len] = [f_1 .. f_i, C_{i+1} .. C_N, g_i, g_{i-1} .. g_1]; the centre is at
@@ -124,6 +132,7 @@ function multiply(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:
             F = svd!(Tm)
             k, w, c = truncated_rank(F.S, cutoff, maxbonddim)
             discarded += w
+            bound += sqrt(w)
             capped |= c
             U = F.U[:, 1:k]
             rmul!(U, Diagonal(F.S[1:k]))
@@ -152,13 +161,90 @@ function multiply(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:
 
     cores = chain[1:N]                 # centre on C_1, C_2 .. C_N right-orthogonal
     if final_truncation
-        w, c = sweep_truncate!(cores, cutoff, maxbonddim)
+        w, c, sb = sweep_truncate!(cores, cutoff, maxbonddim)
         discarded += w
+        bound += sb
         capped |= c
     end
-    info = MultiplyInfo(maximum(peak_per_step), peak_per_step,
-                        [size(c, 3) for c in cores[1:(N - 1)]], N * (N - 1) ÷ 2, discarded, capped)
-    return cores, info
+    pass = (peak_bonddim = maximum(peak_per_step), peak_bonddim_per_step = peak_per_step,
+            bonddims = [size(c, 3) for c in cores[1:(N - 1)]], n_swaps = N * (N - 1) ÷ 2,
+            discarded_weight = discarded, hit_maxbonddim = capped, error_bound = bound)
+    return cores, pass
+end
+
+"""
+    multiply(A, B; tolerance, maxbonddim = typemax(Int), final_truncation = true,
+             nsamples = 4000, rng = Random.default_rng(),
+             pilot_cutoff = tolerance^2 / (N - 1)^2, safety = 0.5, max_attempts = 3) -> (C, info)
+    multiply(A, B; cutoff, maxbonddim = typemax(Int), final_truncation = true,
+             nsamples = 0, rng = Random.default_rng()) -> (C, info)
+
+Elementwise product `C(x) = A(x) B(x)` of two tensor trains with the same site dimensions, by
+the swap network of arXiv:2410.19747, Fig. 1B. `A` and `B` are vectors of three-leg cores laid
+out `(left, site, right)` with dimension-one boundary bonds, or
+`TensorCrossInterpolation.TensorTrain{T,3}`; the result has the kind of the inputs and the
+promoted element type. Inputs are not modified.
+
+**`tolerance` mode**, the one to use: the relative L2 error of the returned product is
+measured, not assumed. A pilot pass runs at `pilot_cutoff`, whose default assumes the error
+scales like `(N - 1) sqrt(cutoff)` (the number of bonds; measured on sharp products); the
+exact residual `C(x) - A(x) B(x)` is sampled at `nsamples` random points; if
+`estimate + 2 stderr > tolerance`, the ratio `kappa = estimate / sqrt(cutoff)`, which is
+nearly cutoff-independent for a given pair of trains, sets the next cutoff
+`safety * (tolerance / kappa)^2`, up to `max_attempts` passes. The result carries
+`info.error_estimate`, `info.error_stderr` and `info.verified`; an unverified product (a bond
+cap, or the attempt limit) is returned, not thrown, and the caller decides.
+
+**`cutoff` mode**, for expert use: one pass at a fixed relative discarded squared weight per
+SVD (the paper's `epsilon`, ITensors' relative `cutoff`). What it does *not* promise: the
+total error of a many-truncation algorithm is a problem-dependent multiple of
+`sqrt(cutoff)`, about the number of bonds on sharp products. Pass `nsamples > 0` to measure it.
+
+Exactly one of `tolerance` and `cutoff` must be given. `maxbonddim` caps every bond the
+algorithm creates, inside the truncation. With `final_truncation = true` the result receives
+one more truncating sweep and is returned left-canonical with the norm on its last core.
+The measurement covers this multiplication's own truncations; errors the inputs already carry
+are inherited by any product. Cost `O(N^2 d^3 chi^3)`, memory `O(d^2 chi^2)` with
+`chi = info.peak_bonddim`; tightening the tolerance grows `chi` steeply, so read
+`info.cutoffs[end]` and `info.peak_bonddim` when a product is slow.
+"""
+function multiply(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:AbstractArray{TB,3}};
+                  cutoff::Union{Nothing,Real} = nothing, tolerance::Union{Nothing,Real} = nothing,
+                  maxbonddim::Integer = typemax(Int), final_truncation::Bool = true,
+                  nsamples::Union{Nothing,Integer} = nothing, rng::AbstractRNG = Random.default_rng(),
+                  pilot_cutoff::Union{Nothing,Real} = nothing, safety::Real = 0.5,
+                  max_attempts::Integer = 3) where {TA<:Number,TB<:Number}
+    (cutoff === nothing) == (tolerance === nothing) &&
+        throw(ArgumentError("give exactly one of `cutoff` and `tolerance`; got cutoff = $(cutoff), tolerance = $(tolerance)"))
+    maxbonddim >= 1 || throw(ArgumentError("maxbonddim must be at least 1, got $(maxbonddim)"))
+    _check_inputs(A, B)
+    N = length(A)
+    if cutoff !== nothing
+        cutoff >= 0 || throw(ArgumentError("cutoff must be non-negative, got $(cutoff)"))
+        ns = nsamples === nothing ? 0 : Int(nsamples)
+        ns == 0 || ns >= 100 || throw(ArgumentError("nsamples must be 0 or at least 100, got $(ns)"))
+        cores, pass = _multiply_pass(A, B, Float64(cutoff), maxbonddim, final_truncation)
+        est, se = ns == 0 ? (NaN, NaN) : sampled_relative_error(A, B, cores, rng, ns)
+        return cores, MultiplyInfo(pass..., est, se, false, 1, [Float64(cutoff)], ns)
+    end
+    tolerance > 0 || throw(ArgumentError("tolerance must be positive, got $(tolerance)"))
+    0 < safety <= 1 || throw(ArgumentError("safety must lie in (0, 1], got $(safety)"))
+    max_attempts >= 1 || throw(ArgumentError("max_attempts must be at least 1, got $(max_attempts)"))
+    ns = nsamples === nothing ? 4000 : Int(nsamples)
+    ns >= 100 || throw(ArgumentError("nsamples must be at least 100 in tolerance mode, got $(ns)"))
+    pilot = pilot_cutoff === nothing ? Float64(tolerance)^2 / max(N - 1, 1)^2 : Float64(pilot_cutoff)
+    pilot > 0 || throw(ArgumentError("pilot_cutoff must be positive, got $(pilot)"))
+    cutoffs = [pilot]
+    cores, pass = _multiply_pass(A, B, pilot, maxbonddim, final_truncation)
+    est, se = sampled_relative_error(A, B, cores, rng, ns)
+    while est + 2se > tolerance && length(cutoffs) < max_attempts
+        kappa = est / sqrt(cutoffs[end])
+        next = isfinite(kappa) ? safety * (Float64(tolerance) / kappa)^2 : cutoffs[end] / 100
+        push!(cutoffs, next)
+        cores, pass = _multiply_pass(A, B, next, maxbonddim, final_truncation)
+        est, se = sampled_relative_error(A, B, cores, rng, ns)
+    end
+    return cores, MultiplyInfo(pass..., est, se, est + 2se <= tolerance, length(cutoffs), cutoffs, ns)
 end
 
 function multiply(A::TCI.TensorTrain{TA,3}, B::TCI.TensorTrain{TB,3}; kwargs...) where {TA,TB}

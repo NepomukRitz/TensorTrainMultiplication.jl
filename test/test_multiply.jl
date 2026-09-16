@@ -126,15 +126,102 @@ end
     rng = MersenneTwister(17)
     A = random_train(rng, Float64, [2, 2, 2], 2)
     B = random_train(rng, Float64, [2, 3, 2], 2)
-    @test_throws DimensionMismatch multiply(A, B)
-    @test_throws DimensionMismatch multiply(A, A[1:2])
+    @test_throws DimensionMismatch multiply(A, B; cutoff = 0.0)
+    @test_throws DimensionMismatch multiply(A, A[1:2]; cutoff = 0.0)
     @test_throws ArgumentError multiply(A, A; cutoff = -1.0)
-    @test_throws ArgumentError multiply(A, A; maxbonddim = 0)
+    @test_throws ArgumentError multiply(A, A; cutoff = 0.0, maxbonddim = 0)
     bad = [copy(a) for a in A]
     bad[1] = randn(rng, 2, 2, size(A[1], 3))                 # left boundary bond of dimension 2
-    @test_throws ArgumentError multiply(bad, A)
+    @test_throws ArgumentError multiply(bad, A; cutoff = 0.0)
     broken = [copy(a) for a in A]
     broken[2] = randn(rng, size(A[2], 1) + 1, 2, size(A[2], 3))   # inconsistent internal bond
-    @test_throws DimensionMismatch multiply(broken, A)
-    @test_throws ArgumentError multiply(Array{Float64,3}[], Array{Float64,3}[])
+    @test_throws DimensionMismatch multiply(broken, A; cutoff = 0.0)
+    @test_throws ArgumentError multiply(Array{Float64,3}[], Array{Float64,3}[]; cutoff = 0.0)
+end
+
+@testset "error_bound is a rigorous bound and cutoff mode reports it" begin
+    rng = MersenneTwister(21)
+    A = random_train(rng, Float64, fill(2, 8), 4)
+    B = random_train(rng, Float64, fill(2, 8), 4)
+    truth = dense_vector(A) .* dense_vector(B)
+    for cutoff in (1e-2, 1e-4, 1e-6)
+        C, info = multiply(A, B; cutoff = cutoff)
+        err = norm(dense_vector(C) - truth) / norm(truth)
+        @test err <= info.error_bound
+        @test info.error_bound <= (info.n_swaps + 7) * sqrt(cutoff) + 1e-10
+        @test !info.verified && info.attempts == 1 && info.cutoffs == [cutoff]
+        @test isnan(info.error_estimate) && info.nsamples == 0
+    end
+    R = 12
+    for (f, g) in ((x -> 1 / ((x - 0.5)^2 + 1e-3), x -> tanh((x - 0.5) / 0.05)),
+                   (x -> (x - 0.5) / ((x - 0.5)^2 + 0.02^2), x -> tanh((x - 0.5) / 0.02)))
+        A = quantics_train(f, R)
+        B = quantics_train(g, R)
+        truth = quantics_values(x -> f(x) * g(x), R)
+        for cutoff in (1e-6, 1e-10)
+            C, info = multiply(A, B; cutoff = cutoff, nsamples = 4000, rng = MersenneTwister(1))
+            err = norm(dense_vector(C) - truth) / norm(truth)
+            @test err <= info.error_bound <= 30 * err
+            @test abs(info.error_estimate - err) <= 3 * info.error_stderr + 1e-12
+        end
+    end
+end
+
+@testset "tolerance mode verifies the requested relative L2 error" begin
+    R = 12
+    cases = ((x -> exp(-3x), x -> 1 / (1 + x)),
+             (x -> 1 / ((x - 0.5)^2 + 1e-3), x -> tanh((x - 0.5) / 0.05)),
+             (x -> 1 / ((x - 0.3)^2 + 1e-4) + 1 / ((x - 0.7)^2 + 1e-4), x -> cos(40x)),
+             (x -> exp(-200(x - 0.4)^2), x -> exp(-200(x - 0.41)^2)),
+             (x -> (x - 0.5) / ((x - 0.5)^2 + 0.02^2), x -> tanh((x - 0.5) / 0.02)))
+    for (f, g) in cases
+        A = quantics_train(f, R)
+        B = quantics_train(g, R)
+        truth = quantics_values(x -> f(x) * g(x), R)
+        for tol in (1e-2, 1e-4, 1e-6)
+            C, info = multiply(A, B; tolerance = tol, rng = MersenneTwister(5))
+            err = norm(dense_vector(C) - truth) / norm(truth)
+            @test info.verified
+            @test info.error_estimate + 2 * info.error_stderr <= tol
+            @test err <= tol
+            @test 1 <= info.attempts <= 3
+            @test length(info.cutoffs) == info.attempts
+            @test info.cutoffs[1] == tol^2 / (R - 1)^2
+            @test issorted(info.cutoffs; rev = true)
+            @test info.nsamples == 4000
+        end
+    end
+end
+
+@testset "an exact product verifies on the pilot pass" begin
+    A = [reshape([1.0, exp(-2.0^-j)], 1, 2, 1) for j in 1:10]
+    B = [reshape([1.0, exp(-2 * 2.0^-j)], 1, 2, 1) for j in 1:10]
+    C, info = multiply(A, B; tolerance = 1e-6)
+    @test info.verified && info.attempts == 1 && info.error_estimate < 1e-13
+    @test all(info.bonddims .== 1)
+end
+
+@testset "a bond cap that defeats the tolerance is reported, not thrown" begin
+    rng = MersenneTwister(23)
+    A = random_train(rng, Float64, fill(2, 8), 4)
+    B = random_train(rng, Float64, fill(2, 8), 4)
+    C, info = multiply(A, B; tolerance = 1e-10, maxbonddim = 3, rng = MersenneTwister(2))
+    @test !info.verified
+    @test info.error_estimate > 1e-10
+    @test info.hit_maxbonddim
+    @test info.attempts == 3
+    @test all(info.bonddims .<= 3)
+end
+
+@testset "tolerance mode argument errors" begin
+    rng = MersenneTwister(29)
+    A = random_train(rng, Float64, [2, 2, 2], 2)
+    @test_throws ArgumentError multiply(A, A)                                   # neither
+    @test_throws ArgumentError multiply(A, A; cutoff = 1e-8, tolerance = 1e-4)  # both
+    @test_throws ArgumentError multiply(A, A; tolerance = 0.0)
+    @test_throws ArgumentError multiply(A, A; tolerance = 1e-4, safety = 0.0)
+    @test_throws ArgumentError multiply(A, A; tolerance = 1e-4, safety = 1.5)
+    @test_throws ArgumentError multiply(A, A; tolerance = 1e-4, max_attempts = 0)
+    @test_throws ArgumentError multiply(A, A; tolerance = 1e-4, nsamples = 10)
+    @test_throws ArgumentError multiply(A, A; tolerance = 1e-4, pilot_cutoff = 0.0)
 end
