@@ -21,7 +21,7 @@ Accuracy, three fields that mean different things:
 - `error_bound`: the rigorous bound `sum_i sqrt(w_i)` over every truncation (each happens in
   mixed-canonical gauge, so its error is exactly `sqrt(w_i)` times the current norm, and the
   triangle inequality sums them). Always valid, and pessimistic by a factor that grows with
-  the number of truncating swaps: 2-16 on 12-site products, about 8 on a 28-site production
+  the number of truncating swaps: 1.9-17.4 on 12-site products, about 8 on a 28-site production
   product. A diagnostic, not the control.
 
 `attempts` counts the passes run and `cutoffs` lists their cutoffs, the last being the
