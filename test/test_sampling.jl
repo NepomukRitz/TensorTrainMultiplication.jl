@@ -59,10 +59,13 @@ end
     ones_train = [reshape([1.0, 1.0], 1, 2, 1) for _ in 1:N]
     spike = 2.0^(N - k)
     @test sqrt(spike * 100 / ((2.0^N - spike) + spike * 121)) ≈ 0.1096849982679642
-    blind = count(1:20) do seed
+    # 4000 uniform points miss the spike's 128 of 2^20 with probability exp(-0.49) = 0.61,
+    # so most seeds report nothing at all; the bound is loose because the RNG stream is not
+    # the same on every Julia version.
+    blind = count(1:40) do seed
         est, se, ess_num, _ = TensorTrainMultiplication.sampled_relative_error(
             A, ones_train, ones_train, MersenneTwister(seed), 4000)
         est == 0.0 && se == 0.0 && ess_num == 0.0
     end
-    @test blind > 10
+    @test blind >= 10
 end
