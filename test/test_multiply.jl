@@ -199,6 +199,47 @@ end
     C, info = multiply(A, B; tolerance = 1e-6)
     @test info.verified && info.attempts == 1 && info.error_estimate < 1e-13
     @test all(info.bonddims .== 1)
+    # the rigorous bound alone already meets the tolerance, so an effective sample size the
+    # product can never reach does not stop it verifying
+    @test info.error_bound <= 1e-6
+    @test multiply(A, B; tolerance = 1e-6, min_ess = 10^6)[2].verified
+end
+
+@testset "a residual on a vanishing fraction of the grid is not certified" begin
+    # A = [x_1..x_21 all 1] (1 + 10 [x_22 x_23 x_24 all 1]), rank 2, supported on 8 of the
+    # 2^24 points; B = 1. A uniform sample misses the support, so the residual the rank-1 cap
+    # leaves behind is invisible to it: the estimate is exactly 0 with a standard error of 0.
+    N, m = 24, 21
+    A = Vector{Array{Float64,3}}(undef, N)
+    for j in 1:m
+        A[j] = reshape([1.0, 0.0], 1, 2, 1)
+    end
+    c = zeros(1, 2, 2); c[1, :, 1] .= 1.0; c[1, 1, 2] = 1.0; A[m + 1] = c
+    for j in (m + 2):(N - 1)
+        c = zeros(2, 2, 2); c[1, :, 1] .= 1.0; c[2, 1, 2] = 1.0; A[j] = c
+    end
+    c = zeros(2, 2, 1); c[1, :, 1] .= 1.0; c[2, 1, 1] = 10.0; A[N] = c
+    B = [reshape([1.0, 1.0], 1, 2, 1) for _ in 1:N]
+
+    C, info = multiply(A, B; tolerance = 1e-3, maxbonddim = 1, rng = MersenneTwister(11))
+    support = [[fill(1, m); [1 + ((n >> (j - 1)) & 1) for j in 1:(N - m)]] for n in 0:(2^(N - m) - 1)]
+    exact = [TensorTrainMultiplication.evaluate_cores(A, i) for i in support]
+    got = [TensorTrainMultiplication.evaluate_cores(C, i) for i in support]
+    @test norm(got - exact) / norm(exact) > 0.1          # the product is far off
+    @test info.error_estimate == 0 && info.error_stderr == 0
+    @test info.ess_num < 30 && info.ess_den < 30         # the sample carries no mass
+    @test info.error_bound > 1e-3                        # and the bound does not rescue it
+    @test !info.verified
+end
+
+@testset "a benign product verifies on an informative sample" begin
+    R = 12
+    A = quantics_train(x -> exp(-3x), R)
+    B = quantics_train(x -> 1 / (1 + x), R)
+    C, info = multiply(A, B; tolerance = 1e-4, rng = MersenneTwister(13))
+    @test info.verified
+    @test info.ess_num >= 30 && info.ess_den >= 30
+    @test info.min_ess == 30
 end
 
 @testset "a bond cap that defeats the tolerance is reported, not thrown" begin
@@ -209,7 +250,7 @@ end
     @test !info.verified
     @test info.error_estimate > 1e-10
     @test info.hit_maxbonddim
-    @test info.attempts == 3
+    @test info.attempts == 1          # a capped bond does not respond to a smaller cutoff
     @test all(info.bonddims .<= 3)
 end
 
@@ -224,4 +265,5 @@ end
     @test_throws ArgumentError multiply(A, A; tolerance = 1e-4, max_attempts = 0)
     @test_throws ArgumentError multiply(A, A; tolerance = 1e-4, nsamples = 10)
     @test_throws ArgumentError multiply(A, A; tolerance = 1e-4, pilot_cutoff = 0.0)
+    @test_throws ArgumentError multiply(A, A; tolerance = 1e-4, min_ess = -1)
 end

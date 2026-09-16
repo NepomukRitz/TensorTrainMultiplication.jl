@@ -16,8 +16,8 @@ Accuracy, three fields that mean different things:
   `||C - A o B||_2 / ||A o B||_2` of the returned product and its standard error, from
   `nsamples` uniform random multi-indices against the exact `A(x) B(x)`; consistent, no
   reference computation. `NaN` when `nsamples == 0`.
-- `verified`: a `tolerance` was requested and `error_estimate + 2 error_stderr <= tolerance`.
-  `false` in `cutoff` mode.
+- `verified`: a `tolerance` was requested, `error_estimate + 2 error_stderr <= tolerance`,
+  and the sample was informative (see `min_ess`). `false` in `cutoff` mode.
 - `error_bound`: the rigorous bound `sum_i sqrt(w_i)` over every truncation (each happens in
   mixed-canonical gauge, so its error is exactly `sqrt(w_i)` times the current norm, and the
   triangle inequality sums them). Always valid, and pessimistic by a factor that grows with
@@ -26,6 +26,13 @@ Accuracy, three fields that mean different things:
 
 `attempts` counts the passes run and `cutoffs` lists their cutoffs, the last being the
 returned product's.
+
+Three fields say whether the sample could see the error at all:
+
+- `ess_num` and `ess_den`: the effective sample size of the residual and of the product
+  sample (see [`effective_sample_size`](@ref)). `NaN` when nothing was sampled.
+- `min_ess`: the effective sample size `verified` demands of both, unless `error_bound`
+  already meets the tolerance on its own.
 """
 struct MultiplyInfo
     peak_bonddim::Int
@@ -41,6 +48,9 @@ struct MultiplyInfo
     attempts::Int
     cutoffs::Vector{Float64}
     nsamples::Int
+    ess_num::Float64
+    ess_den::Float64
+    min_ess::Int
 end
 
 function _check_inputs(A, B)
@@ -67,8 +77,8 @@ end
 """
     _multiply_pass(A, B, cutoff, maxbonddim, final_truncation) -> (cores, pass)
 
-One swap-network pass at a fixed `cutoff`, returning the product's cores and a NamedTuple whose
-fields are, in order, the first seven fields of [`MultiplyInfo`](@ref).
+One swap-network pass at a fixed `cutoff`, returning the product's cores and a NamedTuple
+carrying the pass's own diagnostics, named as in [`MultiplyInfo`](@ref).
 """
 function _multiply_pass(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:AbstractArray{TB,3}},
                         cutoff::Real, maxbonddim::Integer,
@@ -175,7 +185,8 @@ end
 """
     multiply(A, B; tolerance, maxbonddim = typemax(Int), final_truncation = true,
              nsamples = 4000, rng = Random.default_rng(),
-             pilot_cutoff = tolerance^2 / (N - 1)^2, safety = 0.5, max_attempts = 3) -> (C, info)
+             pilot_cutoff = tolerance^2 / (N - 1)^2, safety = 0.5, max_attempts = 3,
+             min_ess = 30) -> (C, info)
     multiply(A, B; cutoff, maxbonddim = typemax(Int), final_truncation = true,
              nsamples = 0, rng = Random.default_rng()) -> (C, info)
 
@@ -191,9 +202,17 @@ scales like `(N - 1) sqrt(cutoff)` (the number of bonds; measured on sharp produ
 exact residual `C(x) - A(x) B(x)` is sampled at `nsamples` random points; if
 `estimate + 2 stderr > tolerance`, the ratio `kappa = estimate / sqrt(cutoff)`, which is
 nearly cutoff-independent for a given pair of trains, sets the next cutoff
-`safety * (tolerance / kappa)^2`, up to `max_attempts` passes. The result carries
-`info.error_estimate`, `info.error_stderr` and `info.verified`; an unverified product (a bond
-cap, or the attempt limit) is returned, not thrown, and the caller decides.
+`safety * (tolerance / kappa)^2`, up to `max_attempts` passes. Tightening stops early once the
+bond cap binds or the estimate stops improving by more than its own standard error, since
+neither can be helped by a smaller cutoff. The result carries `info.error_estimate`,
+`info.error_stderr` and `info.verified`; an unverified product (a bond cap, or the attempt
+limit) is returned, not thrown, and the caller decides.
+
+Verification also needs the sample to carry the error: the effective sample size of both the
+residual and the product must reach `min_ess`, unless `info.error_bound` meets the tolerance
+on its own and no sampling is needed. A uniform sample cannot certify a product whose residual
+lives on a vanishing fraction of the grid, so such a product comes back `verified = false`
+rather than falsely certified.
 
 **`cutoff` mode**, for expert use: one pass at a fixed relative discarded squared weight per
 SVD (the paper's `epsilon`, ITensors' relative `cutoff`). What it does *not* promise: the
@@ -213,10 +232,11 @@ function multiply(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:
                   maxbonddim::Integer = typemax(Int), final_truncation::Bool = true,
                   nsamples::Union{Nothing,Integer} = nothing, rng::AbstractRNG = Random.default_rng(),
                   pilot_cutoff::Union{Nothing,Real} = nothing, safety::Real = 0.5,
-                  max_attempts::Integer = 3) where {TA<:Number,TB<:Number}
+                  max_attempts::Integer = 3, min_ess::Integer = 30) where {TA<:Number,TB<:Number}
     (cutoff === nothing) == (tolerance === nothing) &&
         throw(ArgumentError("give exactly one of `cutoff` and `tolerance`; got cutoff = $(cutoff), tolerance = $(tolerance)"))
     maxbonddim >= 1 || throw(ArgumentError("maxbonddim must be at least 1, got $(maxbonddim)"))
+    min_ess >= 0 || throw(ArgumentError("min_ess must be non-negative, got $(min_ess)"))
     _check_inputs(A, B)
     N = length(A)
     if cutoff !== nothing
@@ -224,8 +244,11 @@ function multiply(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:
         ns = nsamples === nothing ? 0 : Int(nsamples)
         ns == 0 || ns >= 100 || throw(ArgumentError("nsamples must be 0 or at least 100, got $(ns)"))
         cores, pass = _multiply_pass(A, B, Float64(cutoff), maxbonddim, final_truncation)
-        est, se = ns == 0 ? (NaN, NaN) : sampled_relative_error(A, B, cores, rng, ns)
-        return cores, MultiplyInfo(pass..., est, se, false, 1, [Float64(cutoff)], ns)
+        est, se, en, ed = ns == 0 ? (NaN, NaN, NaN, NaN) : sampled_relative_error(A, B, cores, rng, ns)
+        return cores, MultiplyInfo(pass.peak_bonddim, pass.peak_bonddim_per_step, pass.bonddims,
+                                   pass.n_swaps, pass.discarded_weight, pass.hit_maxbonddim,
+                                   pass.error_bound, est, se, false, 1, [Float64(cutoff)], ns,
+                                   en, ed, Int(min_ess))
     end
     tolerance > 0 || throw(ArgumentError("tolerance must be positive, got $(tolerance)"))
     0 < safety <= 1 || throw(ArgumentError("safety must lie in (0, 1], got $(safety)"))
@@ -236,15 +259,24 @@ function multiply(A::AbstractVector{<:AbstractArray{TA,3}}, B::AbstractVector{<:
     pilot > 0 || throw(ArgumentError("pilot_cutoff must be positive, got $(pilot)"))
     cutoffs = [pilot]
     cores, pass = _multiply_pass(A, B, pilot, maxbonddim, final_truncation)
-    est, se = sampled_relative_error(A, B, cores, rng, ns)
+    est, se, en, ed = sampled_relative_error(A, B, cores, rng, ns)
     while est + 2se > tolerance && length(cutoffs) < max_attempts
+        # A capped bond, and an estimate that has stopped moving, are both insensitive to the
+        # cutoff: another pass costs a full O(N^2 d^3 chi^3) and cannot lower the error.
+        pass.hit_maxbonddim && break
         kappa = est / sqrt(cutoffs[end])
         next = isfinite(kappa) ? safety * (Float64(tolerance) / kappa)^2 : cutoffs[end] / 100
-        push!(cutoffs, next)
-        cores, pass = _multiply_pass(A, B, next, maxbonddim, final_truncation)
-        est, se = sampled_relative_error(A, B, cores, rng, ns)
+        push!(cutoffs, max(next, eps(Float64)))
+        previous = est
+        cores, pass = _multiply_pass(A, B, cutoffs[end], maxbonddim, final_truncation)
+        est, se, en, ed = sampled_relative_error(A, B, cores, rng, ns)
+        previous - est > se || break
     end
-    return cores, MultiplyInfo(pass..., est, se, est + 2se <= tolerance, length(cutoffs), cutoffs, ns)
+    informative = (en >= min_ess && ed >= min_ess) || pass.error_bound <= tolerance
+    return cores, MultiplyInfo(pass.peak_bonddim, pass.peak_bonddim_per_step, pass.bonddims,
+                               pass.n_swaps, pass.discarded_weight, pass.hit_maxbonddim,
+                               pass.error_bound, est, se, est + 2se <= tolerance && informative,
+                               length(cutoffs), cutoffs, ns, en, ed, Int(min_ess))
 end
 
 function multiply(A::TCI.TensorTrain{TA,3}, B::TCI.TensorTrain{TB,3}; kwargs...) where {TA,TB}
