@@ -13,14 +13,12 @@ See [`multiply`](@ref).
 module TensorTrainMultiplication
 
 using LinearAlgebra
-using Random
 import TensorCrossInterpolation as TCI
 
 export multiply, MultiplyInfo
 
 include("truncation.jl")
 include("canonical.jl")
-include("sampling.jl")
 include("multiply.jl")
 
 end
