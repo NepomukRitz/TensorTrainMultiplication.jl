@@ -55,7 +55,9 @@ variational fit alike -- the relative L2 error behaves as
 err ~ kappa sqrt(cutoff)
 ```
 
-with `kappa` measured at 1.2 to 2.6 times the number of bonds on a 28-site production object.
+with `kappa` measured at 1.2 to 3.5 times the number of bonds on a 28-site production object.
+The factor 2 is a margin over the lower half of that range only: at the top of it the rule
+misses `tol` by about 1.8x.
 To target a relative L2 error `tol`, take
 
 ```
